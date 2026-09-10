@@ -1,0 +1,152 @@
+name: build-plugins
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout projeto
+        uses: actions/checkout@v4
+
+      - name: Checkout JUCE 9.0.1
+        uses: actions/checkout@v4
+        with:
+          repository: juce-framework/JUCE
+          ref: 9.0.1
+          path: third_party/JUCE
+
+      - name: Setup CMake
+        uses: lukka/get-cmake@latest
+
+      - name: Configure (Black Tie AI Producer)
+        run: cmake -S vst3 -B build-producer -G "Visual Studio 17 2022" -A x64 -DJUCE_SOURCE_DIR="$env:GITHUB_WORKSPACE/third_party/JUCE"
+
+      - name: Build (Black Tie AI Producer VST3)
+        run: cmake --build build-producer --config Release --target ChatGPTAbletonAIProducer_VST3 --parallel
+
+      - name: Configure (Black Tie Live)
+        run: cmake -S performance -B build-live -G "Visual Studio 17 2022" -A x64 -DJUCE_SOURCE_DIR="$env:GITHUB_WORKSPACE/third_party/JUCE"
+
+      - name: Build (Black Tie Live VST3)
+        run: cmake --build build-live --config Release --target BlackTieLive_VST3 --parallel
+
+      - name: Stage
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path stage | Out-Null
+          Copy-Item "build-producer/ChatGPTAbletonAIProducer_artefacts/Release/VST3/Black Tie AI Producer.vst3" stage/ -Recurse
+          Copy-Item "build-live/BlackTieLive_artefacts/Release/VST3/Black Tie Live.vst3" stage/ -Recurse
+          @'
+          Black Tie AI Plugins - Windows
+          ==============================
+          1. Copie as pastas .vst3 para:
+             %LOCALAPPDATA%\Programs\Common\VST3   (usuario atual)
+             ou C:\Program Files\Common Files\VST3 (todos os usuarios)
+          2. Ableton: Options > Preferences > Plug-Ins > ative VST3 > Rescan
+          3. Procure "Black Tie AI Producer" e "Black Tie Live"
+          '@ | Set-Content stage/INSTALL.txt -Encoding UTF8
+
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path stage/* -DestinationPath "BlackTieAI-Windows-${env:GITHUB_REF_NAME}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-plugins
+          path: BlackTieAI-Windows-*.zip
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - name: Checkout projeto
+        uses: actions/checkout@v4
+
+      - name: Checkout JUCE 9.0.1
+        uses: actions/checkout@v4
+        with:
+          repository: juce-framework/JUCE
+          ref: 9.0.1
+          path: third_party/JUCE
+
+      - name: Setup CMake
+        uses: lukka/get-cmake@latest
+
+      - name: Configure (Black Tie AI Producer) - binario universal
+        run: cmake -S vst3 -B build-producer -G Xcode -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DJUCE_SOURCE_DIR="$GITHUB_WORKSPACE/third_party/JUCE"
+
+      - name: Build (Producer VST3 + AU)
+        run: |
+          cmake --build build-producer --config Release --target ChatGPTAbletonAIProducer_VST3
+          cmake --build build-producer --config Release --target ChatGPTAbletonAIProducer_AU
+
+      - name: Configure (Black Tie Live) - binario universal
+        run: cmake -S performance -B build-live -G Xcode -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DJUCE_SOURCE_DIR="$GITHUB_WORKSPACE/third_party/JUCE"
+
+      - name: Build (Live VST3 + AU)
+        run: |
+          cmake --build build-live --config Release --target BlackTieLive_VST3
+          cmake --build build-live --config Release --target BlackTieLive_AU
+
+      - name: Ad-hoc codesign (obrigatorio no Apple Silicon)
+        run: |
+          for b in \
+            "build-producer/ChatGPTAbletonAIProducer_artefacts/Release/VST3/Black Tie AI Producer.vst3" \
+            "build-producer/ChatGPTAbletonAIProducer_artefacts/Release/AU/Black Tie AI Producer.component" \
+            "build-live/BlackTieLive_artefacts/Release/VST3/Black Tie Live.vst3" \
+            "build-live/BlackTieLive_artefacts/Release/AU/Black Tie Live.component"; do
+            codesign --force --deep --sign - "$b"
+          done
+
+      - name: Stage
+        run: |
+          mkdir -p stage
+          cp -R "build-producer/ChatGPTAbletonAIProducer_artefacts/Release/VST3/Black Tie AI Producer.vst3" stage/
+          cp -R "build-producer/ChatGPTAbletonAIProducer_artefacts/Release/AU/Black Tie AI Producer.component" stage/
+          cp -R "build-live/BlackTieLive_artefacts/Release/VST3/Black Tie Live.vst3" stage/
+          cp -R "build-live/BlackTieLive_artefacts/Release/AU/Black Tie Live.component" stage/
+          cat > stage/INSTALL.txt <<'EOF'
+          Black Tie AI Plugins - macOS
+          ============================
+          1. Copie as pastas para:
+             VST3      -> ~/Library/Audio/Plug-Ins/VST3/
+             AudioUnit -> ~/Library/Audio/Plug-Ins/Components/
+          2. Se o plugin nao carregar (Gatekeeper), rode no Terminal:
+             xattr -rd com.apple.quarantine ~/Library/Audio/Plug-Ins/VST3/*.vst3
+             xattr -rd com.apple.quarantine ~/Library/Audio/Plug-Ins/Components/*.component
+          3. Ableton: Live > Settings > Plug-Ins > ative AU e/ou VST3 > Rescan
+          EOF
+
+      - name: Zip (preserva permissoes/assinatura)
+        run: |
+          ditto -c -k --sequesterRsrc stage "BlackTieAI-macOS-${GITHUB_REF_NAME}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-plugins
+          path: BlackTieAI-macOS-*.zip
+
+  release:
+    needs: [windows, macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: release
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
