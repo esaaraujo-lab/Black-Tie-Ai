@@ -1,0 +1,35 @@
+{
+  "version": "1.1.0",
+  "product": "ChatGPT × Ableton AI Producer",
+  "status": "source-complete; final audit applied; native target build and host certification required",
+  "framework": {
+    "name": "JUCE",
+    "version": "9.0.1",
+    "pinned": true
+  },
+  "formats": [
+    "VST3",
+    "AU"
+  ],
+  "providers": [
+    "OpenAI",
+    "Gemini",
+    "NVIDIA NIM",
+    "Ollama"
+  ],
+  "liveIntegration": "Ableton Extensions SDK preferred; M4L/Remote Script compatibility fallbacks",
+  "agentLocation": "inside plugin",
+  "requiredCloudRuntime": false,
+  "optionalLocalModelRuntime": "Ollama",
+  "futurePerformanceLayer": true,
+  "thirdPartyPluginHosting": "JUCE-hosted VST3; AU on macOS",
+  "copyPolicy": "No third-party binaries redistributed",
+  "providerArchitecture": {
+    "single": "selected configured provider",
+    "all": "enabled providers sequential candidate generation/validation",
+    "ollama": "optional local and cloud endpoints; not required by cloud providers"
+  },
+  "configuration": "All provider URLs, models, API keys and enable flags are editable in the VST UI",
+  "ollamaRequired": false,
+  "nativeBuildStatus": "not certified in this environment"
+}
