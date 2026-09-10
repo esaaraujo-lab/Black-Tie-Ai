@@ -2,12 +2,22 @@
 #include <stdexcept>
 
 namespace {
-juce::String postJSON(const ProviderConfig& p, const juce::String& payload, int timeoutMs)
+
+juce::var makeTextPart(const juce::String& t)
 {
-    auto endpoint = p.baseUrl.trimCharactersAtEnd("/") + "/chat/completions";
-    juce::URL url(endpoint);
-    auto headers = juce::String("Accept: application/json\r\nContent-Type: application/json\r\n")
-        + (p.apiKey.isEmpty() ? juce::String() : "Authorization: Bearer " + p.apiKey + "\r\n");
+    auto* o = new juce::DynamicObject();
+    o->setProperty("text", t);
+    return juce::var(o);
+}
+
+juce::String postJSON(const ProviderConfig& p, const juce::String& urlStr,
+                      const juce::String& payload, int timeoutMs, bool useBearer)
+{
+    juce::String headers = "Accept: application/json\r\nContent-Type: application/json\r\n";
+    if (p.apiKey.isNotEmpty())
+        headers += useBearer ? ("Authorization: Bearer " + p.apiKey + "\r\n")
+                             : ("x-goog-api-key: " + p.apiKey + "\r\n");
+    juce::URL url(urlStr);
     auto options = juce::URL::InputStreamOptions(juce::URL::ParameterHandling::inAddress)
         .withHttpRequestCmd("POST")
         .withExtraHeaders(headers)
@@ -16,30 +26,101 @@ juce::String postJSON(const ProviderConfig& p, const juce::String& payload, int 
     std::unique_ptr<juce::InputStream> stream(url.withPOSTData(payload).createInputStream(options));
     return stream ? stream->readEntireStreamAsString() : juce::String();
 }
+
+// Extrai a mensagem real de um campo "error" (objeto {"message":...}, string, ou array)
+juce::String errorMessageFrom(const juce::var& parsed)
+{
+    auto probe = parsed;
+    if (probe.isArray() && probe.size() > 0) probe = probe[0];  // gateways que embrulham em array
+    if (auto* o = probe.getDynamicObject())
+    {
+        auto err = o->getProperty("error");
+        if (!err.isVoid())
+        {
+            if (auto* eo = err.getDynamicObject())
+            {
+                auto msg = eo->getProperty("message").toString();
+                if (msg.isEmpty()) msg = juce::JSON::toString(err);
+                return msg;
+            }
+            if (err.isString()) return err.toString();
+            return juce::JSON::toString(err);
+        }
+    }
+    return {};
 }
+
+} // namespace
 
 juce::String ProviderClient::extractText(const juce::var& v)
 {
-    if (auto* o = v.getDynamicObject()) {
+    if (v.isArray() && v.size() > 0) return extractText(v[0]);  // tolera array no topo
+
+    if (auto* o = v.getDynamicObject())
+    {
         auto output = o->getProperty("output_text");
-        if (output.isString()) return output.toString();
+        if (output.isString() && output.toString().isNotEmpty()) return output.toString();
+
         auto choices = o->getProperty("choices");
-        if (auto* a = choices.getArray(); a && !a->isEmpty()) {
-            auto* c = a->getReference(0).getDynamicObject();
-            if (c) {
+        if (auto* a = choices.getArray(); a && !a->isEmpty())
+            if (auto* c = a->getReference(0).getDynamicObject())
+            {
                 auto msg = c->getProperty("message");
-                if (auto* m = msg.getDynamicObject()) {
+                if (auto* m = msg.getDynamicObject())
+                {
                     auto content = m->getProperty("content");
-                    if (content.isString()) return content.toString();
-                    if (auto* parts = content.getArray()) {
+                    if (content.isString() && content.toString().isNotEmpty()) return content.toString();
+                    if (auto* parts = content.getArray())
+                    {
                         juce::String s;
                         for (const auto& part : *parts)
-                            if (auto* po = part.getDynamicObject()) s += po->getProperty("text").toString();
-                        return s;
+                            if (auto* po = part.getDynamicObject())
+                            {
+                                auto th = po->getProperty("thought");
+                                if (th.isBool() && (bool) th) continue;
+                                s += po->getProperty("text").toString();
+                            }
+                        if (s.isNotEmpty()) return s;
                     }
+                    auto rc = m->getProperty("reasoning_content");
+                    if (rc.isString() && rc.toString().isNotEmpty()) return rc.toString();
                 }
             }
+
+        auto out = o->getProperty("output");
+        if (auto* oa = out.getArray())
+        {
+            juce::String s;
+            for (const auto& item : *oa)
+                if (auto* io = item.getDynamicObject())
+                    if (auto* ca = io->getProperty("content").getArray())
+                        for (const auto& cp : *ca)
+                            if (auto* cpo = cp.getDynamicObject())
+                            {
+                                auto t = cpo->getProperty("text");
+                                if (t.isString()) s += t.toString();
+                                else if (auto* to = t.getDynamicObject()) s += to->getProperty("value").toString();
+                            }
+            if (s.isNotEmpty()) return s;
         }
+
+        // Formato NATIVO do Gemini: candidates[0].content.parts[].text
+        auto candidates = o->getProperty("candidates");
+        if (auto* ca = candidates.getArray(); ca && !ca->isEmpty())
+            if (auto* c0 = ca->getReference(0).getDynamicObject())
+                if (auto* co = c0->getProperty("content").getDynamicObject())
+                    if (auto* pa = co->getProperty("parts").getArray())
+                    {
+                        juce::String s;
+                        for (const auto& part : *pa)
+                            if (auto* po = part.getDynamicObject())
+                            {
+                                auto th = po->getProperty("thought");
+                                if (th.isBool() && (bool) th) continue;
+                                s += po->getProperty("text").toString();
+                            }
+                        if (s.isNotEmpty()) return s;
+                    }
     }
     return {};
 }
@@ -71,23 +152,58 @@ juce::String ProviderClient::chatJSON(const ProviderConfig& p, const juce::Strin
 {
     if (!p.local && p.apiKey.isEmpty()) throw std::runtime_error((p.name + ": API key not configured").toStdString());
 
-    auto* root = new juce::DynamicObject();
-    root->setProperty("model", p.model);
-    root->setProperty("temperature", 0.2);
-    juce::Array<juce::var> messages;
-    auto* sys = new juce::DynamicObject(); sys->setProperty("role", "system"); sys->setProperty("content", system); messages.add(sys);
-    auto* usr = new juce::DynamicObject(); usr->setProperty("role", "user"); usr->setProperty("content", user); messages.add(usr);
-    root->setProperty("messages", messages);
-    // Do not force provider-specific structured-output fields here: Gemini/OpenAI-compatible
-    // gateways differ. The system prompt + strict local JSON validation is the portable baseline.
+    // Gemini nativo: a camada OpenAI-compat do generativelanguage nao aceita as
+    // chaves novas (formato AQ.*) — retorna 404. O protocolo nativo aceita.
+    const bool nativeGemini = p.baseUrl.contains("generativelanguage.googleapis.com")
+                           && !p.baseUrl.contains("/openai");
 
-    const auto raw = postJSON(p, juce::JSON::toString(juce::var(root)), timeoutMs);
-    if (raw.isEmpty()) throw std::runtime_error((p.name + ": connection failed").toStdString());
-    const auto parsed = juce::JSON::parse(raw);
-    if (auto* o = parsed.getDynamicObject()) {
-        auto err = o->getProperty("error");
-        if (!err.isVoid()) throw std::runtime_error((p.name + ": " + escapeForError(err.toString())).toStdString());
+    juce::String raw;
+    if (nativeGemini)
+    {
+        const auto urlStr = p.baseUrl.trimCharactersAtEnd("/")
+                          + "/models/" + p.model.trim() + ":generateContent";
+
+        auto* sysObj = new juce::DynamicObject();
+        juce::Array<juce::var> sysParts; sysParts.add(makeTextPart(system));
+        sysObj->setProperty("parts", sysParts);
+
+        auto* turn = new juce::DynamicObject();
+        turn->setProperty("role", "user");
+        juce::Array<juce::var> parts; parts.add(makeTextPart(user));
+        turn->setProperty("parts", parts);
+
+        auto* genCfg = new juce::DynamicObject();
+        genCfg->setProperty("temperature", 0.2);
+
+        auto* root = new juce::DynamicObject();
+        root->setProperty("systemInstruction", juce::var(sysObj));
+        root->setProperty("contents", juce::Array<juce::var>{ turn });
+        root->setProperty("generationConfig", juce::var(genCfg));
+
+        raw = postJSON(p, urlStr, juce::JSON::toString(juce::var(root)), timeoutMs, /*useBearer*/ false);
     }
+    else
+    {
+        const auto urlStr = p.baseUrl.trimCharactersAtEnd("/") + "/chat/completions";
+
+        auto* root = new juce::DynamicObject();
+        root->setProperty("model", p.model);
+        root->setProperty("temperature", 0.2);
+        juce::Array<juce::var> messages;
+        auto* sys = new juce::DynamicObject(); sys->setProperty("role", "system"); sys->setProperty("content", system); messages.add(sys);
+        auto* usr = new juce::DynamicObject(); usr->setProperty("role", "user"); usr->setProperty("content", user); messages.add(usr);
+        root->setProperty("messages", messages);
+
+        raw = postJSON(p, urlStr, juce::JSON::toString(juce::var(root)), timeoutMs, /*useBearer*/ true);
+    }
+
+    if (raw.isEmpty()) throw std::runtime_error((p.name + ": connection failed (HTTP error or timeout)").toStdString());
+
+    const auto parsed = juce::JSON::parse(raw);
+    const auto errMsg = errorMessageFrom(parsed);
+    if (errMsg.isNotEmpty())
+        throw std::runtime_error((p.name + ": " + escapeForError(errMsg)).toStdString());
+
     const auto text = extractText(parsed);
     if (text.isEmpty()) throw std::runtime_error((p.name + ": empty model response").toStdString());
     return cleanJSON(text);
